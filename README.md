@@ -31,7 +31,10 @@ make test
 
 ```ini
 scontrol_path = scontrol
-formula = 0.75 * 100 * load / cpus + 0.25 * weight
+state_file = /var/lib/abhpc-lbs/history
+history_fast_minutes = 30
+history_slow_minutes = 80
+formula = history
 min_weight = 0
 max_weight = 100
 ```
@@ -49,20 +52,35 @@ scontrol_path = /opt/slurm/bin/scontrol
 | --- | --- |
 | `load` | Slurm 控制器记录的节点 `CPULoad`，与 `sinfo %O` 同源 |
 | `cpus` | Slurm `CPUTot`，可能包含超线程 |
-| `weight` | 本轮查询到的节点权重，用于历史平滑 |
+| `weight` | 本轮查询到的 Slurm 节点权重 |
+| `history` | 按 CPU 数归一化并平滑后的历史负载评分，100 表示负载等于 CPU 数 |
 
 公式支持数字、`+ - * /`、括号和正负号，结果按权重上下限截断后取整。
 配置支持 `#` 注释，公式不加引号。命令行参数优先于配置文件：
 
 ```bash
 ./abhpc-lbs -c ./abhpc-lbs.conf \
-  --formula '0.5 * 100 * load / cpus + 0.5 * weight' \
+  --formula '0.9 * history + 0.1 * 100 * load / cpus' \
   --dry-run
 ```
 
 `load` 使用 Slurm 最近一次上报的 5 分钟负载均值，可能有延迟，不等于 CPU 使用率。
-5 分钟是负载的统计时间尺度，执行周期由定时器或 cron 单独设置。
-公式中的 `weight` 用于平滑权重变化；调整执行周期时，应一起评估平滑系数。
+程序按实际经过时间做两级指数平滑，默认时间常数为 30 和 80 分钟。
+两个参数单位均为分钟，须满足 `0 < history_fast_minutes < history_slow_minutes`。
+定时器间隔可以单独调整，正常采样间隔的小幅波动不会改变时间常数。
+
+默认连续采样时，计入 Slurm 自身平滑后的累计影响系数约为：
+
+| 距离当前的时间范围 | 累计影响系数 |
+| --- | ---: |
+| 最近 1 小时 | 29% |
+| 最近 2 小时 | 63% |
+| 最近 6 小时 | 98% |
+
+这些是未触及权重上下限时的近似值。`state_file` 保存浮点历史值，程序重启后
+继续使用；写入 Slurm 时才取整。首次运行以现有 Slurm 权重初始化，需要持续
+采样约 6 小时来积累历史。停采期间的负载无法还原，正常运行时应保持定期采样。
+`--dry-run` 只读历史，不写状态文件。自定义状态路径需提前创建可写的父目录。
 
 ## RPM
 
@@ -98,9 +116,9 @@ EL7 和 EL8 应分别构建、安装对应的包，避免高版本 glibc 依赖�
 
 ```bash
 # EL7
-sudo yum install ./build/rpm-el7/RPMS/*/abhpc-lbs-1.0.0-2.el7.*.rpm
+sudo yum install ./build/rpm-el7/RPMS/*/abhpc-lbs-1.1.0-1.el7.*.rpm
 # EL8
-sudo dnf install ./build/rpm-el8/RPMS/*/abhpc-lbs-1.0.0-2.el8.*.rpm
+sudo dnf install ./build/rpm-el8/RPMS/*/abhpc-lbs-1.1.0-1.el8.*.rpm
 ```
 
 EL7 容器使用 [CentOS Vault](https://vault.centos.org/7.9.2009/) 和
@@ -131,7 +149,8 @@ OnUnitInactiveSec=5min
 ```
 
 然后执行 `systemctl daemon-reload` 和 `systemctl restart abhpc-lbs.timer`。
-运行用户或环境通过 `systemctl edit abhpc-lbs.service` 设置。也可使用 cron，
+运行用户或环境通过 `systemctl edit abhpc-lbs.service` 设置；运行用户须能写入
+状态文件所在目录。也可使用 cron，
 只启用一个调度入口，避免重复执行。
 
 ## 注意
@@ -141,6 +160,7 @@ OnUnitInactiveSec=5min
 - 节点处于离线、未响应及电源切换等状态时，跳过并保留旧权重，不影响本轮成功状态。
   在线节点的负载或状态字段无效、公式计算失败时，保留该节点权重并返回非零状态。
   批次写入失败则停止后续更新；已更新的节点不回滚。
+- 历史文件损坏、无法写入或已有另一轮运行持有历史锁时，程序报错退出。
 - Slurm 重启或重新配置可能恢复节点权重，下一轮按实际查询值计算。
   上线前先用 `--dry-run` 核对结果。
 

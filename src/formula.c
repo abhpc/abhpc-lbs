@@ -44,20 +44,20 @@ static double atom(struct parser *p)
         else
             p->error = "missing closing parenthesis";
     } else if (isalpha((unsigned char)*p->p)) {
-        static const char *const names[] = {"load", "cpus", "weight"};
+        static const char *const names[] = {"load", "cpus", "weight", "history"};
         const char *start = p->p;
         while (isalnum((unsigned char)*p->p) || *p->p == '_')
             p->p++;
         size_t i;
-        for (i = 0; i < 3; i++) {
+        for (i = 0; i < 4; i++) {
             if (strlen(names[i]) == (size_t)(p->p - start) &&
                 strncmp(start, names[i], (size_t)(p->p - start)) == 0) {
                 value = p->values ? p->values[i] : 0;
                 break;
             }
         }
-        if (i == 3)
-            p->error = "unknown variable (supported: load, cpus, weight)";
+        if (i == 4)
+            p->error = "unknown variable (supported: load, cpus, weight, history)";
     } else if (isdigit((unsigned char)*p->p) || *p->p == '.') {
         char *end;
         errno = 0;
@@ -107,7 +107,7 @@ static double expression(struct parser *p)
     return value;
 }
 
-const char *formula_eval(const char *formula, const double values[3], double *result)
+const char *formula_eval(const char *formula, const double values[4], double *result)
 {
     if (strlen(formula) > FORMULA_MAX)
         return "formula exceeds 1024 characters";

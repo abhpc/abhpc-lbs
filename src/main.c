@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "formula.h"
+#include "history.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -15,11 +16,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef VERSION
-#define VERSION "1.0.0"
+#define VERSION "1.1.0"
 #endif
 #ifndef CONFIG_PATH
 #define CONFIG_PATH "/etc/abhpc-lbs.conf"
@@ -31,6 +33,8 @@
 struct config {
     char formula[FORMULA_MAX + 1];
     char scontrol_path[PATH_MAX];
+    char state_file[PATH_MAX];
+    unsigned history_fast_minutes, history_slow_minutes;
     unsigned min_weight, max_weight;
 };
 
@@ -38,6 +42,7 @@ struct node {
     char *name;
     unsigned cpus, weight, next_weight;
     double load;
+    struct history history;
     bool unavailable, load_valid, update;
 };
 
@@ -85,6 +90,13 @@ static bool number(const char *text, unsigned max, unsigned *result)
 
 static void set_option(struct config *config, const char *key, const char *value)
 {
+    if (strcmp(key, "state_file") == 0) {
+        if (*value != '/' || strlen(value) >= sizeof(config->state_file))
+            die("state_file must be an absolute path shorter than %zu characters",
+                sizeof(config->state_file));
+        strcpy(config->state_file, value);
+        return;
+    }
     if (strcmp(key, "scontrol_path") == 0) {
         if (!*value || strlen(value) >= sizeof(config->scontrol_path) ||
             (strcmp(value, "scontrol") != 0 && *value != '/'))
@@ -99,14 +111,21 @@ static void set_option(struct config *config, const char *key, const char *value
         return;
     }
     unsigned *target;
-    if (strcmp(key, "min_weight") == 0) {
+    unsigned max = WEIGHT_MAX;
+    if (strcmp(key, "history_fast_minutes") == 0) {
+        target = &config->history_fast_minutes;
+        max = 10080;
+    } else if (strcmp(key, "history_slow_minutes") == 0) {
+        target = &config->history_slow_minutes;
+        max = 10080;
+    } else if (strcmp(key, "min_weight") == 0) {
         target = &config->min_weight;
     } else if (strcmp(key, "max_weight") == 0) {
         target = &config->max_weight;
     } else {
         die("unknown configuration key: %s", key);
     }
-    if (!number(value, WEIGHT_MAX, target))
+    if (!number(value, max, target) || (max != WEIGHT_MAX && !*target))
         die("invalid value for %s: %s", key, value);
 }
 
@@ -286,6 +305,97 @@ static struct node *read_nodes(size_t *count, char *scontrol_path)
     return nodes;
 }
 
+static int lock_history(const char *path)
+{
+    char lock_path[PATH_MAX + 6];
+    snprintf(lock_path, sizeof(lock_path), "%s.lock", path);
+    int fd = open(lock_path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB) < 0)
+        die("cannot lock history %s: %s", path, strerror(errno));
+    return fd;
+}
+
+static void read_history(const char *path, struct node *nodes, size_t count, time_t now)
+{
+    FILE *file = fopen(path, "r");
+    if (!file && errno != ENOENT)
+        die("cannot read history %s: %s", path, strerror(errno));
+    if (file) {
+        char *line = NULL;
+        size_t size = 0;
+        if (getline(&line, &size, file) < 0 || strcmp(trim(line), "abhpc-lbs-state-v1"))
+            die("invalid history header in %s; no weights changed", path);
+        while (getline(&line, &size, file) != -1) {
+            char name[256], extra;
+            long long updated;
+            struct history history;
+            if (sscanf(line, "%255s %lld %lf %lf %c", name, &updated,
+                       &history.fast, &history.slow, &extra) != 4 ||
+                !valid_name(name) || updated <= 0 || updated > (long long)now ||
+                !isfinite(history.fast) || history.fast < 0 ||
+                !isfinite(history.slow) || history.slow < 0)
+                die("invalid history record in %s; no weights changed", path);
+            history.updated = (time_t)updated;
+            struct node key = {.name = name};
+            struct node *node = bsearch(&key, nodes, count, sizeof(*nodes), by_name);
+            if (node) {
+                if (node->history.updated)
+                    die("duplicate history for %s; no weights changed", name);
+                node->history = history;
+            }
+        }
+        if (ferror(file))
+            die("cannot read history %s; no weights changed", path);
+        free(line);
+        fclose(file);
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!nodes[i].history.updated)
+            nodes[i].history = (struct history){now, nodes[i].weight, nodes[i].weight};
+    }
+}
+
+static void save_history(const char *path, const struct node *nodes, size_t count)
+{
+    char temporary_path[PATH_MAX + 8];
+    snprintf(temporary_path, sizeof(temporary_path), "%s.XXXXXX", path);
+    int fd = mkstemp(temporary_path);
+    if (fd < 0)
+        die("cannot create history file %s: %s; no weights changed", path, strerror(errno));
+    FILE *file = fdopen(fd, "w");
+    if (!file) {
+        close(fd);
+        unlink(temporary_path);
+        die("cannot open history file %s; no weights changed", path);
+    }
+    int failed = fprintf(file, "abhpc-lbs-state-v1\n") < 0;
+    for (size_t i = 0; i < count; i++) {
+        const struct history *history = &nodes[i].history;
+        if (fprintf(file, "%s %lld %.17g %.17g\n", nodes[i].name,
+                    (long long)history->updated, history->fast, history->slow) < 0)
+            failed = 1;
+    }
+    if (fflush(file) || fsync(fd))
+        failed = 1;
+    if (fclose(file))
+        failed = 1;
+    if (failed || rename(temporary_path, path)) {
+        unlink(temporary_path);
+        die("cannot save history %s: %s; no weights changed", path, strerror(errno));
+    }
+    char directory[PATH_MAX];
+    strcpy(directory, path);
+    char *slash = strrchr(directory, '/');
+    if (slash == directory)
+        slash[1] = '\0';
+    else
+        *slash = '\0';
+    fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0 || fsync(fd))
+        die("cannot sync history directory %s; no weights changed", directory);
+    close(fd);
+}
+
 static int by_weight(const void *a, const void *b)
 {
     const struct node *na = a, *nb = b;
@@ -334,14 +444,16 @@ static void usage(void)
          "  -n, --dry-run         Print calculations without updating Slurm\n"
          "  -h, --help            Show help\n"
          "  -V, --version         Show version\n"
-         "Variables: load (Slurm CPULoad), cpus, weight; operators: + - * / ( )");
+         "Variables: load (Slurm CPULoad), cpus, weight, history; operators: + - * / ( )");
 }
 
 int main(int argc, char **argv)
 {
     struct config config = {
-        .formula = "0.75 * 100 * load / cpus + 0.25 * weight",
+        .formula = "history",
         .scontrol_path = "scontrol",
+        .state_file = "/var/lib/abhpc-lbs/history",
+        .history_fast_minutes = 30, .history_slow_minutes = 80,
         .min_weight = 0, .max_weight = 100
     };
     const char *path = CONFIG_PATH, *formula = NULL;
@@ -372,15 +484,22 @@ int main(int argc, char **argv)
         set_option(&config, "formula", formula);
     if (config.min_weight > config.max_weight)
         die("min_weight must not exceed max_weight");
+    if (config.history_fast_minutes >= config.history_slow_minutes)
+        die("history_fast_minutes must be less than history_slow_minutes");
     double result;
     const char *error = formula_eval(config.formula, NULL, &result);
     if (error)
         die("invalid formula: %s", error);
+    int lock_fd = dry_run ? -1 : lock_history(config.state_file);
     size_t count = 0, changed = 0, skipped = 0;
     struct node *nodes = read_nodes(&count, config.scontrol_path);
+    time_t now = time(NULL);
+    if (now <= 0)
+        die("cannot read system time");
+    read_history(config.state_file, nodes, count, now);
     int failed = 0;
     if (dry_run)
-        puts("NODE CPUS LOAD OLD_WEIGHT NEW_WEIGHT");
+        puts("NODE CPUS LOAD HISTORY OLD_WEIGHT NEW_WEIGHT");
     for (size_t i = 0; i < count; i++) {
         struct node *node = &nodes[i];
         if (node->unavailable || !node->load_valid) {
@@ -388,11 +507,25 @@ int main(int argc, char **argv)
                     node->unavailable ? "node unavailable" : "missing/invalid CPULoad or State",
                     node->weight);
             skipped++;
+            node->history.updated = now;
             if (!node->unavailable)
                 failed = 1;
             continue;
         }
-        double values[] = {node->load, node->cpus, node->weight};
+        double score = node->load / node->cpus * 100;
+        struct history next = node->history;
+        /* shortcut: unobserved intervals use the latest report; sample regularly for accurate history. */
+        history_advance(&next, now, score, config.history_fast_minutes, config.history_slow_minutes);
+        if (!isfinite(score) || !isfinite(next.fast) || !isfinite(next.slow)) {
+            fprintf(stderr, "abhpc-lbs: %s: non-finite history; keeping weight %u\n",
+                    node->name, node->weight);
+            node->history.updated = now;
+            skipped++;
+            failed = 1;
+            continue;
+        }
+        node->history = next;
+        double values[] = {node->load, node->cpus, node->weight, node->history.slow};
         error = formula_eval(config.formula, values, &result);
         if (error) {
             fprintf(stderr, "abhpc-lbs: %s: %s; keeping weight %u\n",
@@ -409,15 +542,20 @@ int main(int argc, char **argv)
         node->update = node->next_weight != node->weight;
         changed += node->update;
         if (dry_run)
-            printf("%s %u %.2f %u %u\n", node->name, node->cpus, node->load,
+            printf("%s %u %.2f %.6f %u %u\n", node->name, node->cpus, node->load,
+                   node->history.slow,
                    node->weight, node->next_weight);
     }
-    if (!dry_run)
+    if (!dry_run) {
+        save_history(config.state_file, nodes, count);
         failed |= update_nodes(nodes, count, config.scontrol_path);
+    }
     fprintf(stderr, "abhpc-lbs: nodes=%zu changed=%zu skipped=%zu dry_run=%s\n",
             count, changed, skipped, dry_run ? "yes" : "no");
     for (size_t i = 0; i < count; i++)
         free(nodes[i].name);
     free(nodes);
+    if (lock_fd >= 0)
+        close(lock_fd);
     return failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }

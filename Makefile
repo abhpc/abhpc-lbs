@@ -1,5 +1,5 @@
 NAME := abhpc-lbs
-VERSION := 1.0.0
+VERSION := 1.1.0
 CC ?= cc
 CPPFLAGS ?=
 CFLAGS ?= -O2 -g
@@ -13,20 +13,26 @@ RPMBUILD ?= rpmbuild
 RPM_TOPDIR ?= $(CURDIR)/build/rpm
 CONTAINER_ENGINE ?= docker
 PYTHON ?= python3
-SOURCES := src/main.c src/formula.c
+SOURCES := src/main.c src/formula.c src/history.c
 DISTFILES := Makefile README.md README.en.md LICENSE abhpc-lbs.conf src tests packaging
 
 .PHONY: all test install clean dist rpm srpm rpm-el7 rpm-el8
 all: $(NAME)
 
-$(NAME): $(SOURCES) src/formula.h Makefile
-	$(CC) $(CPPFLAGS) -DVERSION='"$(VERSION)"' -DCONFIG_PATH='"$(SYSCONFDIR)/$(NAME).conf"' $(CFLAGS) -std=c11 -Wall -Wextra -Wpedantic $(LDFLAGS) -o $@ $(SOURCES) $(LDLIBS)
+$(NAME): $(SOURCES) src/formula.h src/history.h Makefile
+	$(CC) $(CPPFLAGS) -DVERSION='"$(VERSION)"' -DCONFIG_PATH='"$(SYSCONFDIR)/$(NAME).conf"' $(CFLAGS) -std=c11 -Wall -Wextra -Wpedantic $(LDFLAGS) -o $@ $(SOURCES) $(LDLIBS) -lm
 
-test: $(NAME)
+build/test-history: tests/test_history.c src/history.c src/history.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra -Wpedantic $(LDFLAGS) -o $@ tests/test_history.c src/history.c $(LDLIBS) -lm
+
+test: $(NAME) build/test-history
+	./build/test-history
 	$(PYTHON) -m unittest discover -s tests -v
 
 install: $(NAME)
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(SYSCONFDIR) $(DESTDIR)$(SYSTEMD_UNITDIR)
+	install -d -m 0750 $(DESTDIR)/var/lib/$(NAME)
 	install -m 0755 $(NAME) $(DESTDIR)$(BINDIR)/$(NAME)
 	@test -e $(DESTDIR)$(SYSCONFDIR)/$(NAME).conf || install -m 0644 $(NAME).conf $(DESTDIR)$(SYSCONFDIR)/$(NAME).conf
 	sed 's|@BINDIR@|$(BINDIR)|g; s|@SYSCONFDIR@|$(SYSCONFDIR)|g' packaging/$(NAME).service.in > $(DESTDIR)$(SYSTEMD_UNITDIR)/$(NAME).service

@@ -1,6 +1,6 @@
 Name:           abhpc-lbs
-Version:        1.0.0
-Release:        2%{?dist}
+Version:        1.1.0
+Release:        1%{?dist}
 Summary:        Dynamic node weight balancing for Slurm clusters
 License:        MIT
 URL:            https://github.com/abhpc/abhpc-lbs
@@ -31,11 +31,15 @@ make test
 %license LICENSE
 %doc README.md README.en.md
 %{_bindir}/abhpc-lbs
+%dir %attr(0750,root,root) %{_localstatedir}/lib/abhpc-lbs
 %config(noreplace) %{_sysconfdir}/abhpc-lbs.conf
 /usr/lib/systemd/system/abhpc-lbs.service
 /usr/lib/systemd/system/abhpc-lbs.timer
 
 %changelog
+* Sat Nov 07 2026 abhpc-lbs maintainers - 1.1.0-1
+- Persist floating-point load history with configurable time-based smoothing.
+
 * Sat Nov 07 2026 abhpc-lbs maintainers - 1.0.0-2
 - Skip unavailable nodes without failing an otherwise successful run.
 

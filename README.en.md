@@ -34,7 +34,10 @@ A file specified with `--config` must exist.
 
 ```ini
 scontrol_path = scontrol
-formula = 0.75 * 100 * load / cpus + 0.25 * weight
+state_file = /var/lib/abhpc-lbs/history
+history_fast_minutes = 30
+history_slow_minutes = 80
+formula = history
 min_weight = 0
 max_weight = 100
 ```
@@ -53,7 +56,8 @@ A missing or non-executable file causes an error.
 | --- | --- |
 | `load` | The controller's recorded `CPULoad`, from the same source as `sinfo %O` |
 | `cpus` | Slurm `CPUTot`, which may include hardware threads |
-| `weight` | The node weight read at the start of this run, used for smoothing |
+| `weight` | The Slurm node weight read at the start of this run |
+| `history` | Smoothed historical load score normalized by CPU count; 100 means load equals CPU count |
 
 Formulas support numbers, `+ - * /`, parentheses and unary signs. Results are clamped
 to the configured weight limits, then truncated to integers. Configuration files
@@ -61,14 +65,33 @@ support `#` comments; do not quote formulas. Command-line options override the f
 
 ```bash
 ./abhpc-lbs -c ./abhpc-lbs.conf \
-  --formula '0.5 * 100 * load / cpus + 0.5 * weight' \
+  --formula '0.9 * history + 0.1 * 100 * load / cpus' \
   --dry-run
 ```
 
 `load` is the five-minute load average last reported by Slurm. It may lag and is
-not CPU utilization. The five-minute average and the execution interval are
-independent; set the latter through the timer or cron. The `weight` term smooths
-weight changes. Review the smoothing coefficients when changing the interval.
+not CPU utilization. The program applies two stages of exponential smoothing using
+elapsed time, with default time constants of 30 and 80 minutes. Both settings are
+in minutes and must satisfy `0 < history_fast_minutes < history_slow_minutes`.
+The timer interval is independent; small variations in sampling intervals do not
+change the time constants.
+
+With regular sampling, the default cumulative influence, including Slurm's own
+smoothing, is approximately:
+
+| Time before the current run | Cumulative influence |
+| --- | ---: |
+| Last 1 hour | 29% |
+| Last 2 hours | 63% |
+| Last 6 hours | 98% |
+
+These estimates assume weights have not reached their configured limits.
+`state_file` stores floating-point history across restarts. Values are truncated
+only when writing Slurm weights. The first run initializes history from existing
+Slurm weights; allow about six hours of continuous sampling to build the history.
+Load during gaps cannot be reconstructed, so keep sampling regularly.
+`--dry-run` reads history without writing the state file. For a custom state path,
+create a writable parent directory first.
 
 ## RPM
 
@@ -104,9 +127,9 @@ dependencies on a newer glibc. Have the Slurm client installed before proceeding
 
 ```bash
 # EL7
-sudo yum install ./build/rpm-el7/RPMS/*/abhpc-lbs-1.0.0-2.el7.*.rpm
+sudo yum install ./build/rpm-el7/RPMS/*/abhpc-lbs-1.1.0-1.el7.*.rpm
 # EL8
-sudo dnf install ./build/rpm-el8/RPMS/*/abhpc-lbs-1.0.0-2.el8.*.rpm
+sudo dnf install ./build/rpm-el8/RPMS/*/abhpc-lbs-1.1.0-1.el8.*.rpm
 ```
 
 The EL7 container uses [CentOS Vault](https://vault.centos.org/7.9.2009/) and the
@@ -139,6 +162,7 @@ OnUnitInactiveSec=5min
 
 Then run `systemctl daemon-reload` and `systemctl restart abhpc-lbs.timer`.
 Set the service user or environment through `systemctl edit abhpc-lbs.service`.
+The service user must be able to write to the state file's directory.
 You can use cron instead; enable only one scheduler to avoid duplicate runs.
 
 ## Operational notes
@@ -151,6 +175,8 @@ You can use cron instead; enable only one scheduler to avoid duplicate runs.
   fields on an online node, or formula errors, preserve that node's weight and cause
   a nonzero exit status. A failed update batch stops subsequent updates; completed
   updates are not rolled back.
+- Corrupt or unwritable history, or a history lock held by another run, causes
+  the program to exit with an error.
 - A Slurm restart or reconfiguration may restore node weights. The next run uses
   the values it reads. Check results with `--dry-run` before deployment.
 

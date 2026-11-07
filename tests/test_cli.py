@@ -1,8 +1,10 @@
 import json
+import fcntl
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -48,7 +50,8 @@ class CLITest(unittest.TestCase):
             executable.write_text(FAKE_COMMAND)
             executable.chmod(0o755)
         self.config = self.directory / "lbs.conf"
-        self.config.write_text("")
+        self.state = self.directory / "history"
+        self.write_config("")
         self.data = {"records": record("node1") + record("node10")}
         self.environment = dict(os.environ, LBS_FIXTURE=str(self.directory),
                                 PATH=str(self.bin) + os.pathsep + os.environ["PATH"])
@@ -62,6 +65,9 @@ class CLITest(unittest.TestCase):
         self.assertEqual(result.returncode, 0 if ok else 1, result.stderr)
         return result
 
+    def write_config(self, text):
+        self.config.write_text("state_file = " + str(self.state) + "\n" + text)
+
     def calls(self, command=None):
         log = self.directory / "calls.jsonl"
         calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
@@ -74,11 +80,13 @@ class CLITest(unittest.TestCase):
         return {line.split()[0]: int(line.split()[-1])
                 for line in result.stdout.splitlines()[1:]}
 
-    def test_default_formula_exact_host_matching_and_truncation(self):
-        self.data["records"] = record("node1", load="4") + record("node10", load="2")
+    def test_default_history_starts_from_existing_slurm_weights(self):
+        self.data["records"] = record("node1", load="4") + record("node10", weight=40, load="2")
         result = self.run_lbs("--dry-run")
-        self.assertEqual(self.weights(result), {"node1": 42, "node10": 23})
+        self.assertEqual(self.weights(result), {"node1": 20, "node10": 40})
         self.assertEqual(self.updates(), [])
+        self.assertFalse(self.state.exists())
+        self.assertFalse(Path(str(self.state) + ".lock").exists())
 
     def test_expression_operators_variables_and_precedence(self):
         formulas = {
@@ -88,6 +96,7 @@ class CLITest(unittest.TestCase):
             "-(weight - 2 * +load) + 30": 16,
             "1e1 + .5 * weight": 20,
             "(weight - 20) / cpus": 0,
+            "history + 1": 21,
         }
         for formula, expected in formulas.items():
             with self.subTest(formula=formula):
@@ -95,10 +104,10 @@ class CLITest(unittest.TestCase):
                 self.assertEqual(self.weights(result)["node1"], expected)
 
     def test_config_reload_cli_precedence_and_limits(self):
-        self.config.write_text("# custom policy\nformula = 500\nmin_weight=10\n"
+        self.write_config("# custom policy\nformula = 500\nmin_weight=10\n"
                                "max_weight=80\n")
         self.assertEqual(self.weights(self.run_lbs("-n"))["node1"], 80)
-        self.config.write_text(self.config.read_text().replace("500", "-500"))
+        self.write_config(self.config.read_text().replace("500", "-500"))
         self.assertEqual(self.weights(self.run_lbs("-n"))["node1"], 10)
         self.assertEqual(self.weights(self.run_lbs("-n", "-f", "42"))["node1"], 42)
 
@@ -107,7 +116,7 @@ class CLITest(unittest.TestCase):
         slurm_bin.mkdir(parents=True)
         executable = slurm_bin / "scontrol"
         (self.bin / "scontrol").rename(executable)
-        self.config.write_text("scontrol_path = " + str(executable) + "\n")
+        self.write_config("scontrol_path = " + str(executable) + "\n")
         self.run_lbs("-f", "42")
         calls = self.calls("scontrol")
         self.assertEqual(len(calls), 2)
@@ -121,7 +130,7 @@ class CLITest(unittest.TestCase):
                 if present:
                     executable.write_text("#!/bin/sh\nexit 0\n")
                     executable.chmod(0o644)
-                self.config.write_text("scontrol_path = " + str(executable) + "\n")
+                self.write_config("scontrol_path = " + str(executable) + "\n")
                 result = self.run_lbs(ok=False)
                 self.assertIn(str(executable), result.stderr)
         self.assertEqual(self.calls(), [])
@@ -164,7 +173,7 @@ class CLITest(unittest.TestCase):
 
     def test_zero_load_is_valid(self):
         self.data["records"] = record("node1", load="0")
-        self.assertEqual(self.weights(self.run_lbs("-n")), {"node1": 5})
+        self.assertEqual(self.weights(self.run_lbs("-n", "-f", "100 * load / cpus")), {"node1": 0})
 
     def test_unavailable_nodes_do_not_use_cached_load(self):
         for state in ("DOWN", "UNKNOWN", "FUTURE", "ERROR", "IDLE+NOT_RESPONDING", "IDLE*",
@@ -222,9 +231,12 @@ class CLITest(unittest.TestCase):
                        "max_weight=4294967295", "min_weight=11\nmax_weight=10",
                        "max_weight=1.5",
                        "scontrol_path=", "scontrol_path=./scontrol", "scontrol_path=slurm/bin",
-                       "scontrol_path=/" + "a" * 4096):
+                       "scontrol_path=/" + "a" * 4096,
+                       "state_file=relative", "state_file=", "history_fast_minutes=0",
+                       "history_slow_minutes=abc", "history_fast_minutes=80",
+                       "history_slow_minutes=30", "history_slow_minutes=10081"):
             with self.subTest(config=config):
-                self.config.write_text(config)
+                self.write_config(config)
                 self.run_lbs(ok=False)
         self.assertEqual(self.calls(), [])
 
@@ -252,6 +264,61 @@ class CLITest(unittest.TestCase):
     def test_missing_config_is_reported(self):
         self.config.unlink()
         self.run_lbs(ok=False)
+        self.assertEqual(self.calls(), [])
+
+    def test_fractional_history_survives_invocations(self):
+        self.data["records"] = record("node1", weight=0, load="8")
+        self.state.write_text("abhpc-lbs-state-v1\nnode1 {} 0 0\n".format(int(time.time()) - 60))
+        self.run_lbs()
+        fields = self.state.read_text().splitlines()[1].split()
+        self.assertGreater(float(fields[2]), 0)
+        self.assertGreater(float(fields[3]), 0)
+        self.assertLess(float(fields[3]), 1)
+        fields[1] = str(int(time.time()) - 600)
+        self.state.write_text("abhpc-lbs-state-v1\n" + " ".join(fields) + "\n")
+        self.run_lbs()
+        self.assertGreater(int(self.updates()[-1]["args"][-1].split("=")[1]), 0)
+
+    def test_dry_run_reads_history_without_writing_it(self):
+        self.data["records"] = record("node1", weight=0, load="8")
+        contents = "abhpc-lbs-state-v1\nnode1 {} 0 0\n".format(int(time.time()) - 3600)
+        self.state.write_text(contents)
+        result = self.run_lbs("-n")
+        self.assertGreater(self.weights(result)["node1"], 25)
+        self.assertEqual(self.state.read_text(), contents)
+        self.assertEqual(self.updates(), [])
+        self.assertFalse(Path(str(self.state) + ".lock").exists())
+
+    def test_history_time_constants_are_configurable(self):
+        self.data["records"] = record("node1", weight=0, load="8")
+        self.state.write_text("abhpc-lbs-state-v1\nnode1 {} 0 0\n".format(int(time.time()) - 3600))
+        self.assertLess(self.weights(self.run_lbs("-n"))["node1"], 40)
+        self.write_config("history_fast_minutes=1\nhistory_slow_minutes=2\n")
+        self.assertGreater(self.weights(self.run_lbs("-n"))["node1"], 95)
+
+    def test_corrupt_history_is_preserved_and_prevents_updates(self):
+        now = int(time.time()) - 60
+        records = ("bad header\n", "abhpc-lbs-state-v1\nnode1 {} nan 0\n".format(now),
+                   "abhpc-lbs-state-v1\nnode1 {} -1 0\n".format(now),
+                   "abhpc-lbs-state-v1\nnode1 {} 0 0\n".format(now + 7200),
+                   "abhpc-lbs-state-v1\nnode1 {} 0\n".format(now),
+                   "abhpc-lbs-state-v1\n" + "node1 {} 0 0\n".format(now) * 2)
+        for contents in records:
+            with self.subTest(contents=contents):
+                self.state.write_text(contents)
+                self.run_lbs("-f", "42", ok=False)
+                self.assertEqual(self.state.read_text(), contents)
+        self.assertEqual(self.updates(), [])
+
+    def test_history_lock_prevents_overlapping_updates(self):
+        with Path(str(self.state) + ".lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.run_lbs("-f", "42", ok=False)
+        self.assertEqual(self.calls(), [])
+
+    def test_unwritable_history_path_prevents_updates(self):
+        self.write_config("state_file=" + str(self.directory / "missing" / "history") + "\n")
+        self.run_lbs("-f", "42", ok=False)
         self.assertEqual(self.calls(), [])
 
 if __name__ == "__main__":
