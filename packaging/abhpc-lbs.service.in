@@ -1,0 +1,9 @@
+[Unit]
+Description=Adjust Slurm node weights from historical load
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment="PATH=@BINDIR@:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=@BINDIR@/abhpc-lbs --config @SYSCONFDIR@/abhpc-lbs.conf

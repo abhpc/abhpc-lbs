@@ -1,0 +1,11 @@
+FROM centos:7.9.2009
+
+RUN sed -i -e 's|^mirrorlist=|#mirrorlist=|' \
+    -e 's|^#baseurl=http://mirror.centos.org/centos/$releasever|baseurl=https://vault.centos.org/7.9.2009|' \
+    /etc/yum.repos.d/CentOS-Base.repo \
+    && yum -y install gcc make python3 rpm-build epel-release \
+    && sed -i -e 's|^metalink=|#metalink=|' \
+    -e 's|^#baseurl=http://download.fedoraproject.org/pub/epel/7/|baseurl=https://archives.fedoraproject.org/pub/archive/epel/7/|' \
+    /etc/yum.repos.d/epel.repo \
+    && yum -y install slurm \
+    && yum clean all

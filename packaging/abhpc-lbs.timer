@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically adjust Slurm node weights
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+Unit=abhpc-lbs.service
+
+[Install]
+WantedBy=timers.target

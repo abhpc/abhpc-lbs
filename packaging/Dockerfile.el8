@@ -1,0 +1,5 @@
+FROM rockylinux:8
+
+RUN dnf -y install gcc make python3 rpm-build epel-release \
+    && dnf -y --enablerepo=powertools install slurm \
+    && dnf clean all
