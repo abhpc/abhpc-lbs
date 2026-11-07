@@ -9,7 +9,7 @@ updates by weight. Nodes with invalid load or calculation errors keep their curr
 ## Build and run
 
 Building requires GCC and Make. Tests require Python 3.6+. At runtime, the program
-uses only Slurm's `scontrol`; it does not need SSH access to compute nodes.
+uses Slurm's `scontrol`.
 
 Run as a user with permission to update Slurm nodes. For a custom Slurm installation,
 set `scontrol_path` in the configuration. Set `SLURM_CONF` and the authentication
@@ -65,21 +65,10 @@ support `#` comments; do not quote formulas. Command-line options override the f
   --dry-run
 ```
 
-`load` is the last reported value. A query does not trigger a fresh sample, so the
-value may lag. Updates depend on Slurm's reporting mechanism and settings such as
-`SlurmdTimeout`. The Slurm Linux implementation checked here uses the five-minute
-load average; see the [Slurm load collection source](https://github.com/SchedMD/slurm/blob/slurm-22-05-11-1/src/slurmd/slurmd/get_mach_stat.c).
-Load average is not CPU utilization. The `weight` term provides historical smoothing;
-the program does not read job accounting history. The five-minute average and the
-execution interval are independent. Set the latter through the timer or cron, and
-review the smoothing coefficients when changing it.
-
-When upgrading, replace `load1`, `load5` and `load15` in old formulas with `load` and
-review the coefficients. The previous 15-minute load uses a different averaging
-period. Remove `fanout`, `connect_timeout` and `command_timeout` from old configurations,
-and remove `-j` from invocations. RPM preserves existing configurations, so migrate
-them manually. Unmigrated configurations cause an error rather than silently changing
-the formula's meaning.
+`load` is the five-minute load average last reported by Slurm. It may lag and is
+not CPU utilization. The five-minute average and the execution interval are
+independent; set the latter through the timer or cron. The `weight` term smooths
+weight changes. Review the smoothing coefficients when changing the interval.
 
 ## RPM
 

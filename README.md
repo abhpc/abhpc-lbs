@@ -8,8 +8,7 @@
 
 ## 编译与运行
 
-构建需要 GCC、Make，测试需要 Python 3.6+。运行只需要 Slurm 的 `scontrol`，
-无需 SSH 登录计算节点。
+构建需要 GCC、Make，测试需要 Python 3.6+。运行需要 Slurm 的 `scontrol`。
 
 运行用户须有 Slurm 节点管理权限。
 自定义 Slurm 安装可在配置中指定 `scontrol_path`；`SLURM_CONF` 和认证环境按集群设置。
@@ -61,17 +60,9 @@ scontrol_path = /opt/slurm/bin/scontrol
   --dry-run
 ```
 
-`load` 是最近一次上报值，查询不会触发即时采样，可能有延迟；更新受 Slurm
-上报机制和 `SlurmdTimeout` 等配置影响。核对的 Slurm Linux 实现取 5 分钟
-负载均值，见 [Slurm 负载采集源码](https://github.com/SchedMD/slurm/blob/slurm-22-05-11-1/src/slurmd/slurmd/get_mach_stat.c)。
-负载均值不等于 CPU 使用率。历史平滑由公式中的 `weight` 完成，程序不读取
-作业记账历史。5 分钟是负载的统计时间尺度，执行周期由定时器或 cron 设置；
-调整执行周期时，应一起评估平滑系数。
-
-升级时将旧公式中的 `load1`、`load5`、`load15` 改为 `load`，并重新评估系数。
-原先的 15 分钟负载与此值口径不同。删除旧配置中的 `fanout`、`connect_timeout`、
-`command_timeout`，调用参数中也不再使用 `-j`。RPM 会保留已有配置，需手动迁移；
-未迁移的配置会报错退出，不会静默更换公式含义。
+`load` 使用 Slurm 最近一次上报的 5 分钟负载均值，可能有延迟，不等于 CPU 使用率。
+5 分钟是负载的统计时间尺度，执行周期由定时器或 cron 单独设置。
+公式中的 `weight` 用于平滑权重变化；调整执行周期时，应一起评估平滑系数。
 
 ## RPM
 
