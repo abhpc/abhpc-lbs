@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test "$version" = "$(sed -n 's/^VERSION := //p' Makefile)"
+          test -f ".github/release-notes/$version.md"
+
+      - name: Build and test EL7 and EL8 RPMs
+        run: make rpm-el7 rpm-el8
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          shopt -s nullglob
+          el7=(build/rpm-el7/RPMS/x86_64/abhpc-lbs-"$version"-*.el7.x86_64.rpm)
+          el8=(build/rpm-el8/RPMS/x86_64/abhpc-lbs-"$version"-*.el8.x86_64.rpm)
+          test "${#el7[@]}" -eq 1
+          test "${#el8[@]}" -eq 1
+          gh release create "$GITHUB_REF_NAME" "${el7[@]}" "${el8[@]}" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "$version" \
+            --notes-file ".github/release-notes/$version.md"
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --latest
